@@ -159,6 +159,20 @@ async def stage_research(job_id: str) -> None:
         db.update_status(job_id, JobStatus.FAILED.value, error=redact_secrets(str(exc)))
         await notify(job_id, f"❌ Roteiro reprovado na validação: {exc}")
         return
+    except Exception as exc:
+        from engine import GeminiQuotaError
+
+        db.update_status(job_id, JobStatus.FAILED.value, error=redact_secrets(str(exc)))
+        if isinstance(exc, GeminiQuotaError):
+            await notify(
+                job_id,
+                "🌙 Cota gratuita do Gemini esgotada por hoje. O job volta para a fila "
+                "automaticamente quando o bot reiniciar após a virada da cota "
+                "(ou use /retry_now)."
+            )
+        else:
+            await notify(job_id, f"❌ Falha ao gerar roteiro: {redact_secrets(str(exc))}")
+        return
 
     words, est_sec = script_stats(script)
     folder.write_script(script)

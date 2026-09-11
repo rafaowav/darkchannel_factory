@@ -20,7 +20,8 @@ def _gemini(prompt: str) -> str:
 
         return _gemini_generate(prompt)
     except Exception as exc:
-        logger.error("Research: Gemini falhou: %s", exc)
+        # Cota/limite: briefing é opcional – degrada suave, sem matar o job
+        logger.warning("Research: Gemini indisponível (%s). Briefing fallback.", exc)
         return ""
 
 

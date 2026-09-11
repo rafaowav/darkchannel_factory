@@ -107,12 +107,14 @@ class JobManager:
 
     async def resume_pending(self) -> int:
         """Re-enfileira jobs retomáveis após restart (pula estados que esperam humano)."""
-        from models import NON_RESUMABLE_STATUSES
-
         count = 0
-        for job in get_db().active_jobs():
-            if job.status in NON_RESUMABLE_STATUSES:
-                continue
+        for job in get_db().list_jobs([JobStatus.IDEA.value], limit=200):
+            await self.queue.put(job.id)
+            count += 1
+        # jobs em estágios mecânicos interrompidos por crash/restart
+        for job in get_db().list_jobs(
+            [JobStatus.QUEUED_RENDER.value, JobStatus.RENDERED.value], limit=200
+        ):
             target = _next_stage_for(job.status, job.type)
             if target and target in self._stages:
                 await self.queue.put(job.id)
@@ -120,6 +122,16 @@ class JobManager:
         if count:
             logger.info("%d jobs retomados da fila persistente.", count)
         return count
+
+    async def retry_failed(self, job_id: str) -> bool:
+        """Coloca um job failed de volta em idea e re-enfileira (cota renovada)."""
+        db = get_db()
+        job = db.get_job(job_id)
+        if job is None or job.status != JobStatus.FAILED.value:
+            return False
+        db.force_status(job_id, JobStatus.IDEA.value)
+        await self.queue.put(job_id)
+        return True
 
     # ------------------------------------------------------------ loop
 

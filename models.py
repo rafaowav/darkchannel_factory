@@ -91,9 +91,21 @@ VALID_TRANSITIONS: Dict[JobStatus, List[JobStatus]] = {
     JobStatus.SCHEDULED: [JobStatus.PUBLISHED, JobStatus.CANCELLED],
     JobStatus.PUBLISHED: [],
     JobStatus.REJECTED: [JobStatus.RESEARCHING, JobStatus.CANCELLED],
-    JobStatus.FAILED: [JobStatus.RESEARCHING, JobStatus.QUEUED_RENDER, JobStatus.CANCELLED],
+    JobStatus.FAILED: [
+        JobStatus.IDEA,               # reprocessar do zero (ex.: cota Gemini renovada)
+        JobStatus.RESEARCHING,
+        JobStatus.QUEUED_RENDER,
+        JobStatus.CANCELLED,
+    ],
     JobStatus.CANCELLED: [],
 }
+
+# Estágios que podem ser re-enfileirados automaticamente após restart
+RESUMABLE_STATUSES: List[str] = [
+    JobStatus.IDEA.value,
+    JobStatus.QUEUED_RENDER.value,
+    JobStatus.RENDERED.value,
+]
 
 # Status que ainda ocupam a fila (não terminais)
 ACTIVE_STATUSES: List[str] = [

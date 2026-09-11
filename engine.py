@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -725,15 +726,44 @@ def load_afiliados() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Gemini – chamada com retry
+# Gemini – chamada com retry, rate-limit e respeito ao RetryInfo
 # ---------------------------------------------------------------------------
+
+GEMINI_MIN_INTERVAL_SECONDS: float = 3.5   # espaçamento mínimo entre chamadas
+_gemini_last_call_ts: float = 0.0
+_gemini_rate_lock = threading.Lock()
+
+
+class GeminiQuotaError(RuntimeError):
+    """Cota diária/free-tier esgotada — não adianta insistir agora."""
+
+    def __init__(self, message: str, retry_in_seconds: float) -> None:
+        super().__init__(message)
+        self.retry_in_seconds = retry_in_seconds
+
+
+def _parse_retry_delay(exc: Exception) -> Optional[float]:
+    """Extrai retryDelay (ex: '43s', '1.5s') do corpo do erro 429."""
+    match = _re.search(r'"retryDelay"\s*:\s*"([\d.]+)s"', str(exc))
+    if not match:
+        match = _re.search(r"retry in ([\d.]+)s", str(exc), flags=_re.I)
+    return float(match.group(1)) if match else None
 
 
 def _gemini_generate(prompt: str) -> str:
     """
-    Envia prompt ao Gemini com retry para 503/429.
-    Retorna o texto da resposta.
+    Envia prompt ao Gemini com throttle global, retry exponencial e
+    tratamento específico de cota (RetryInfo / free-tier diário).
+
+    Returns:
+        Texto da resposta.
+
+    Raises:
+        GeminiQuotaError: cota estourada (com retry_in_seconds para agendar).
+        RuntimeError: falha definitiva (modelo/credencial/esgotado).
     """
+    global _gemini_last_call_ts
+
     if client is None:
         raise RuntimeError(
             "Cliente Gemini não inicializado. Verifique GEMINI_API_KEY no .env"
@@ -741,6 +771,13 @@ def _gemini_generate(prompt: str) -> str:
 
     last_error: Optional[Exception] = None
     for attempt in range(1, MAX_RETRIES + 1):
+        # Throttle global: nunca mais que ~1 chamada a cada MIN_INTERVAL
+        with _gemini_rate_lock:
+            wait = GEMINI_MIN_INTERVAL_SECONDS - (time.monotonic() - _gemini_last_call_ts)
+            if wait > 0:
+                time.sleep(wait)
+            _gemini_last_call_ts = time.monotonic()
+
         try:
             logger.info("Gemini – tentativa %d/%d…", attempt, MAX_RETRIES)
             response = client.models.generate_content(
@@ -759,16 +796,59 @@ def _gemini_generate(prompt: str) -> str:
         except google_exceptions.PermissionDenied as exc:
             logger.error("Permissão negada (403): %s", exc)
             raise RuntimeError("Permissão negada. Verifique a GEMINI_API_KEY.") from exc
-        except (google_exceptions.ServiceUnavailable, google_exceptions.ResourceExhausted) as exc:
+        except (google_exceptions.ResourceExhausted, google_exceptions.TooManyRequests) as exc:
+            delay = _parse_retry_delay(exc)
+            text = str(exc)
+            daily = "PerDay" in text or "quota exceeded" in text.lower() and "day" in text.lower()
+            if daily or (delay and delay > 120):
+                retry_in = delay or 3600
+                logger.error(
+                    "Gemini: cota FREE-TIER diária esgotada (~%ds). Não insistir.",
+                    int(retry_in),
+                )
+                raise GeminiQuotaError(
+                    "Cota diária gratuita do Gemini esgotada. Faça upgrade do plano "
+                    "no AI Studio ou aguarde a virada da cota.",
+                    retry_in_seconds=retry_in,
+                ) from exc
+            last_error = exc
+            backoff = max(delay or RETRY_DELAY_SECONDS, RETRY_DELAY_SECONDS) * attempt
+            logger.warning(
+                "Gemini 429 (rate limit) tentativa %d/%d. Retry em %.0fs…",
+                attempt, MAX_RETRIES, backoff,
+            )
+            if attempt < MAX_RETRIES:
+                time.sleep(backoff)
+            continue
+        except google_exceptions.ServiceUnavailable as exc:
             last_error = exc
             logger.warning(
-                "Indisponível (503/429) tentativa %d/%d. Retry em %ds…",
+                "Indisponível (503) tentativa %d/%d. Retry em %ds…",
                 attempt, MAX_RETRIES, RETRY_DELAY_SECONDS,
             )
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY_SECONDS)
             continue
         except Exception as exc:
+            # SDK novo (google.genai.errors.ClientError) também cai aqui
+            status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            if status == 429 or "RESOURCE_EXHAUSTED" in str(exc):
+                delay = _parse_retry_delay(exc)
+                if delay and delay > 120:
+                    raise GeminiQuotaError(
+                        "Cota diária gratuita do Gemini esgotada. Faça upgrade "
+                        "no AI Studio ou aguarde a virada da cota.",
+                        retry_in_seconds=delay,
+                    ) from exc
+                last_error = exc
+                backoff = max(delay or RETRY_DELAY_SECONDS, RETRY_DELAY_SECONDS) * attempt
+                logger.warning(
+                    "Gemini 429 tentativa %d/%d. Retry em %.0fs…",
+                    attempt, MAX_RETRIES, backoff,
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(backoff)
+                continue
             logger.error("Erro inesperado no Gemini: %s", exc)
             raise
 

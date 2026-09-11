@@ -260,6 +260,7 @@ async def cmd_help(message: Message) -> None:
         "<code>/metadados &lt;job&gt;</code> · <code>/aprovar &lt;job&gt;</code>\n"
         "<code>/rejeitar &lt;job&gt; &lt;motivo&gt;</code> · <code>/regerar &lt;job&gt; alvo</code>\n"
         "<code>/publicado &lt;job&gt; &lt;url&gt;</code> · <code>/cancelar &lt;job&gt;</code>\n"
+        "<code>/retry &lt;job_id|all&gt;</code> re-enfileira job que falhou\n"
         "<code>/limpar_cache</code>",
     )
 
@@ -1030,6 +1031,30 @@ async def cmd_cancelar(message: Message, command: CommandObject) -> None:
     job_id = (command.args or "").strip()
     ok = get_db().update_status(job_id, JobStatus.CANCELLED.value)
     await message.answer(f"{'🚫 Cancelado' if ok else 'Não cancelável'}: {job_id}")
+
+
+@dp.message(Command("retry"))
+async def cmd_retry(message: Message, command: CommandObject) -> None:
+    """Re-enfileira um job que falhou (ex.: cota do Gemini renovada)."""
+    if not is_admin(message):
+        return
+    args = (command.args or "").strip()
+    mgr = get_job_manager()
+    if args == "all":
+        retried = [j.id for j in get_db().list_jobs([JobStatus.FAILED.value], limit=50)]
+        done = 0
+        for jid in retried:
+            if await mgr.retry_failed(jid):
+                done += 1
+        await message.answer(f"🔁 {done} job(s) re-enfileirado(s).")
+        return
+    if not args:
+        await message.answer("Uso: /retry <job_id> ou /retry all")
+        return
+    ok = await mgr.retry_failed(args)
+    await message.answer(
+        f"{'🔁 Job re-enfileirado.' if ok else 'Não foi possível (job inexistente ou não está em failed).'}"
+    )
 
 
 @dp.message(Command("limpar_cache"))
