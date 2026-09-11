@@ -1,0 +1,9 @@
+google-genai
+edge-tts
+requests
+python-dotenv
+aiogram
+shopee-afflib
+pillow
+python-dateutil
+mutagen

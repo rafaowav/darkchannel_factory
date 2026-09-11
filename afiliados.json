@@ -1,0 +1,51 @@
+{
+  "suporte_monitor": {
+    "nome": "Suporte Articulado para Monitor",
+    "descricao": "Organize sua mesa e ganhe espaço com este suporte ajustável. Compatível com monitores de 17 a 32 polegadas.",
+    "imagens": [
+      "https://images.pexels.com/photos/7974/space-desk-workspace-coworking.jpg",
+      "https://images.pexels.com/photos/1029757/pexels-photo-1029757.jpeg"
+    ],
+    "link_shopee": "https://shope.ee/exemplo1",
+    "link_mercadolivre": "https://mercadolivre.com.br/exemplo1"
+  },
+  "teclado_mecanico": {
+    "nome": "Teclado Mecânico RGB 60%",
+    "descricao": "Switch azul, compacto e ideal para programação. Iluminação RGB personalizável.",
+    "imagens": [
+      "https://images.pexels.com/photos/2582937/pexels-photo-2582937.jpeg",
+      "https://images.pexels.com/photos/1772109/pexels-photo-1772109.jpeg"
+    ],
+    "link_shopee": "https://shope.ee/exemplo2",
+    "link_amazon": "https://amzn.to/exemplo2"
+  },
+  "mouse_gamer": {
+    "nome": "Mouse Gamer Wireless RGB",
+    "descricao": "Sensor óptico de 16000 DPI, 7 botões programáveis, bateria de longa duração.",
+    "imagens": [
+      "https://images.pexels.com/photos/5089474/pexels-photo-5089474.jpeg",
+      "https://images.pexels.com/photos/2115256/pexels-photo-2115256.jpeg"
+    ],
+    "link_shopee": "https://shope.ee/exemplo3",
+    "link_amazon": "https://amzn.to/exemplo3"
+  },
+  "webcam_hd": {
+    "nome": "Webcam Full HD 1080p com Microfone",
+    "descricao": "Câmera USB plug-and-play, microfone embutido com cancelamento de ruído, ideal para calls e streams.",
+    "imagens": [
+      "https://images.pexels.com/photos/4553620/pexels-photo-4553620.jpeg"
+    ],
+    "link_shopee": "https://shope.ee/exemplo4",
+    "link_mercadolivre": "https://mercadolivre.com.br/exemplo4"
+  },
+  "headphone_bluetooth": {
+    "nome": "Fone Bluetooth com Cancelamento de Ruído",
+    "descricao": "ANC ativo, 40h de bateria, driver de 40mm. Som grave e nítido para músicas e chamadas.",
+    "imagens": [
+      "https://images.pexels.com/photos/3394650/pexels-photo-3394650.jpeg",
+      "https://images.pexels.com/photos/3780681/pexels-photo-3780681.jpeg"
+    ],
+    "link_shopee": "https://shope.ee/exemplo5",
+    "link_amazon": "https://amzn.to/exemplo5"
+  }
+}

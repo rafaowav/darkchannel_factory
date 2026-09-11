@@ -1,0 +1,33 @@
+# Ambiente / segredos
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Saídas e dados locais (pesados / nunca versionar)
+output/
+data/
+logs/
+assets/
+broll/
+audios/
+
+# Mídias grandes em qualquer pasta
+*.mp4
+*.mp3
+*.jpg
+*.jpeg
+*.png
+*.wav
+*.srt
+
+# IDE / SO
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
