@@ -4,6 +4,7 @@ Três funções independentes: GLOBAL, BRASIL e SHOPEE.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import edge_tts
 import requests
@@ -448,7 +449,7 @@ def render_cinematic_shopee(
     inputs: List[str] = [audio_path]  # índice 0 = narração
 
     # ---------- Camada 1: fundo (clipes em loop, blur, opacidade ~40%) ----------
-    bg_clips = clips[:3] if clips else []
+    bg_clips = clips[:4] if clips else []
     for clip in bg_clips:
         inputs += ["-stream_loop", "-1", "-i", clip]
     next_idx = 1 + len(bg_clips)  # próximo índice livre de entrada
@@ -1047,14 +1048,19 @@ def get_media_duration(path: Union[str, Path]) -> float:
     try:
         from mutagen.mp4 import MP4
 
-        return float(MP4(path_str).info.length)
+        dur = float(MP4(path_str).info.length)
+        if dur > 0:
+            return dur
     except Exception:
         pass
     try:
-        return float(_get_duration(path_str))
+        dur = float(_get_duration(path_str))
+        if dur > 0:
+            return dur
     except Exception as exc:
         logger.warning("Falha ao medir duração de %s: %s", path_str, exc)
-        return 60.0
+    logger.warning("Duração de %s desconhecida – assumindo 10s.", path_str)
+    return 10.0
 
 
 def _fmt_mmss(seconds: float) -> str:
@@ -1084,6 +1090,263 @@ def synthesize_speech(text: str, voice: str, output_path: str) -> str:
 # ---------------------------------------------------------------------------
 # Pexels – download de B‑roll e imagens
 # ---------------------------------------------------------------------------
+
+PEXELS_MIN_CLIP_SECONDS: float = 8.0
+PEXELS_TARGET_COVERAGE_RATIO: float = 1.35
+PEXELS_MAX_SCENES: int = 40
+_PEXELS_PAGE_SIZE: int = 15
+
+
+def _pexels_headers() -> Dict[str, str]:
+    return {"Authorization": PEXELS_API_KEY}
+
+
+def _download_file(url: str, filepath: str, timeout: int = 180) -> None:
+    """Baixa um arquivo binário (clipe/imagem) com streaming."""
+    resp = requests.get(url, timeout=timeout, stream=True)
+    resp.raise_for_status()
+    with open(filepath, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+
+def _search_pexels_videos(
+    query: str, orientation: str = "landscape", per_page: int = _PEXELS_PAGE_SIZE
+) -> List[Dict[str, Any]]:
+    """Busca vídeos no Pexels e retorna a lista de resultados (máx. por página)."""
+    try:
+        resp = requests.get(
+            "https://api.pexels.com/videos/search",
+            headers=_pexels_headers(),
+            params={
+                "query": query,
+                "per_page": per_page,
+                "orientation": orientation,
+                "size": "medium",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("videos", [])
+    except requests.RequestException as exc:
+        logger.error("Erro ao buscar vídeos no Pexels ('%s'): %s", query, exc)
+        return []
+
+
+def _search_pexels_images(
+    query: str, orientation: str = "landscape", per_page: int = _PEXELS_PAGE_SIZE
+) -> List[Dict[str, Any]]:
+    """Busca fotos no Pexels (endpoint /v1/search)."""
+    try:
+        resp = requests.get(
+            "https://api.pexels.com/v1/search",
+            headers=_pexels_headers(),
+            params={"query": query, "per_page": per_page, "orientation": orientation},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("photos", [])
+    except requests.RequestException as exc:
+        logger.error("Erro ao buscar imagens no Pexels ('%s'): %s", query, exc)
+        return []
+
+
+def _pick_image_link(photo: Dict[str, Any]) -> Optional[str]:
+    """Escolhe a maior variante JPEG de uma foto do Pexels."""
+    src = photo.get("src") or {}
+    width = photo.get("width") or 0
+    height = photo.get("height") or 0
+    if max(width, height) >= 1920:
+        return src.get("original") or src.get("large2x") or src.get("large")
+    return src.get("large2x") or src.get("large") or src.get("original")
+
+
+def build_scene_plan(
+    queries: List[str], target_seconds: float
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """
+    Planeja quantos clipes de vídeo e fotos são necessários para cobrir o
+    áudio sem congelar quadro único. Cada cena de vídeo dura ~10-14s; fotos
+    servem de complemento (Ken Burns) quando o vídeo não cobre tudo.
+
+    Returns:
+        (plan_videos, plan_images): listas de pares (query, filename_base).
+    """
+    import random
+
+    qs = [q for q in dict.fromkeys(queries) if q and q.strip()]
+    if not qs:
+        qs = ["cinematic b roll"]
+    # cenas de ~10-14s, com limite p/ não explode o download em docs longos
+    n_scenes = min(max(len(qs), int(target_seconds // 12) + 1), PEXELS_MAX_SCENES)
+    rng = random.Random(1234)
+    rotated = qs[1:] + qs[:1] if len(qs) > 1 else qs
+    pool = qs + rotated + rng.sample(qs * 3, min(len(qs) * 3, 8))
+    plan_videos = [(pool[i % len(pool)], f"v{i}") for i in range(n_scenes)]
+    extra = max(int(n_scenes * 0.35), 3)
+    img_pool = pool + ["nature landscape", "city aerial timelapse", "abstract lights"]
+    plan_images = [
+        (img_pool[(n_scenes + i) % len(img_pool)], f"i{i}") for i in range(extra)
+    ]
+    return plan_videos, plan_images
+
+
+def fetch_media_pool(
+    plan_videos: List[Tuple[str, str]],
+    plan_images: List[Tuple[str, str]],
+    orientation: str = "landscape",
+    max_workers: int = 6,
+) -> Tuple[List[str], List[str]]:
+    """
+    Busca e baixa em paralelo os candidatos planejados (vídeos + fotos).
+
+    Vídeos: ignora clipes curtos demais (<PEXELS_MIN_CLIP_SECONDS) e evita
+    duplicatas pelo id do Pexels. Fotos entram como pool complementar.
+
+    Returns:
+        (video_paths, image_paths) baixados com sucesso.
+    """
+    if not PEXELS_API_KEY:
+        logger.warning("PEXELS_API_KEY não configurada – sem mídia do Pexels.")
+        return [], []
+
+    seen_ids: set = set()
+    id_lock = threading.Lock()
+    video_paths: List[str] = []
+    image_paths: List[str] = []
+
+    def grab_video(query: str, base: str) -> Optional[str]:
+        for video in _search_pexels_videos(query, orientation):
+            vid = video.get("id")
+            if vid in seen_ids:
+                continue
+            api_dur = video.get("duration") or 0
+            if 0 < api_dur < PEXELS_MIN_CLIP_SECONDS:
+                continue
+            link = _pick_mp4_link(video, orientation)
+            if not link:
+                continue
+            with id_lock:
+                if vid in seen_ids:
+                    continue
+                seen_ids.add(vid)
+            filepath = str(BROLL_DIR / (base + "_" + _unique("broll") + ".mp4"))
+            try:
+                _download_file(link, filepath)
+                real = get_media_duration(filepath)
+                if 0 < api_dur <= 1 and real < PEXELS_MIN_CLIP_SECONDS:
+                    logger.info("Clipe curto descartado (%s, %.1fs).", query, real)
+                    os.remove(filepath)
+                    return None
+                logger.info("Clipe Pexels (%s, %ss): %s", query, api_dur or round(real), filepath)
+                return filepath
+            except requests.RequestException as exc:
+                logger.warning("Falha ao baixar clipe '%s': %s", query, exc)
+                return None
+        return None
+
+    def grab_image(query: str, base: str) -> Optional[str]:
+        for photo in _search_pexels_images(query, orientation):
+            link = _pick_image_link(photo)
+            if not link:
+                continue
+            filepath = str(BROLL_DIR / (base + "_" + _unique("pximg") + ".jpg"))
+            try:
+                _download_file(link, filepath, timeout=60)
+                logger.info("Foto Pexels (%s): %s", query, filepath)
+                return filepath
+            except requests.RequestException as exc:
+                logger.warning("Falha ao baixar foto '%s': %s", query, exc)
+                return None
+        return None
+
+    jobs = [("v", q, b) for q, b in plan_videos] + [("i", q, b) for q, b in plan_images]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(grab_video if kind == "v" else grab_image, query, base): kind
+            for kind, query, base in jobs
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            kind = futures[fut]
+            try:
+                path = fut.result()
+            except Exception as exc:
+                logger.warning("Erro inesperado no pool Pexels: %s", exc)
+                continue
+            if not path:
+                continue
+            (video_paths if kind == "v" else image_paths).append(path)
+
+    logger.info(
+        "Pool Pexels: %d vídeos + %d fotos.", len(video_paths), len(image_paths)
+    )
+    return video_paths, image_paths
+
+
+def ensure_timeline_coverage(
+    clip_paths: List[str],
+    image_paths: List[str],
+    target_seconds: float,
+    min_clip_seconds: float = PEXELS_MIN_CLIP_SECONDS,
+) -> List[str]:
+    """
+    Monta a sequência final de cenas que cobre o áudio: soma das durações dos
+    clipes deve atingir ~target*PEXELS_TARGET_COVERAGE_RATIO. Preenche buracos
+    com fotos (viram clipes Ken Burns via render) ou repetindo clipes longos.
+
+    Args:
+        clip_paths: Clipes de vídeo disponíveis (ordem de preferência).
+        image_paths: Fotos Pexels/Shopee complementares.
+        target_seconds: Duração da narração.
+        min_clip_seconds: Corte mínimo aceitável por clipe.
+
+    Returns:
+        Lista ordenada de paths (vídeos e/ou imagens) para o slideshow.
+    """
+    import random
+
+    need = target_seconds * PEXELS_TARGET_COVERAGE_RATIO
+
+    def _dur(p: str) -> float:
+        d = get_media_duration(p)
+        return d if d and d > 0 else 10.0
+
+    usable = [c for c in clip_paths if _dur(c) >= min_clip_seconds]
+    fallback_only = bool(clip_paths) and not usable
+    chosen: List[str] = []
+    covered = 0.0
+    rng = random.Random(len(clip_paths) + len(image_paths) + int(target_seconds))
+
+    # intercala ordem p/ evitar blocos repetidos da mesma query
+    ordered = list(usable)
+    rng.shuffle(ordered)
+
+    for c in ordered:
+        if covered >= need:
+            break
+        chosen.append(c)
+        covered += min(_dur(c), max(min_clip_seconds, need - covered))
+
+    if covered < need:
+        for img in image_paths:
+            if covered >= need:
+                break
+            chosen.append(img)
+            covered += 6.0  # cada foto vira cena Ken Burns de ~6s
+
+    if covered < need and fallback_only:
+        chosen = list(clip_paths)
+        while sum(_dur(c) for c in chosen) < need:
+            chosen.append(rng.choice(clip_paths))
+
+    if covered < need and usable:
+        longest = max(usable, key=_dur)
+        while sum(_dur(c) for c in chosen) < need:
+            chosen.append(longest)
+
+    if not chosen and clip_paths:
+        chosen = [clip_paths[0]]
+    return chosen
 
 
 def download_broll(query: str, orientation: str = "portrait") -> Optional[str]:
@@ -1163,46 +1426,32 @@ def download_brolls(queries: List[str], count: int = 3, orientation: str = "port
         logger.warning("PEXELS_API_KEY não configurada – sem clipes de fundo.")
         return []
 
-    headers = {"Authorization": PEXELS_API_KEY}
-    url = "https://api.pexels.com/videos/search"
     clips: List[str] = []
+    seen_ids: set = set()
 
     for query in queries:
         if len(clips) >= count:
             break
         logger.info("Pexels – buscando clipe de fundo: '%s'", query)
-        try:
-            resp = requests.get(
-                url,
-                headers=headers,
-                params={"query": query, "per_page": 5, "orientation": orientation},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            videos = resp.json().get("videos", [])
-        except requests.RequestException as exc:
-            logger.error("Erro ao buscar vídeos no Pexels ('%s'): %s", query, exc)
-            continue
-
-        downloaded = False
-        for video in videos:
+        got = False
+        for video in _search_pexels_videos(query, orientation):
+            vid = video.get("id")
+            if vid in seen_ids:
+                continue
             link = _pick_mp4_link(video, orientation)
             if not link:
                 continue
             filepath = str(BROLL_DIR / (_unique("broll") + ".mp4"))
             try:
-                vresp = requests.get(link, timeout=180, stream=True)
-                vresp.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in vresp.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                _download_file(link, filepath)
+                seen_ids.add(vid)
                 clips.append(filepath)
                 logger.info("Clipe de fundo salvo (%s): %s", query, filepath)
-                downloaded = True
+                got = True
                 break
             except requests.RequestException as exc:
                 logger.warning("Falha ao baixar clipe '%s': %s", query, exc)
-        if not downloaded:
+        if not got:
             logger.warning("Nenhum clipe útil para '%s'.", query)
 
     logger.info("%d clipes de fundo baixados.", len(clips))
@@ -1430,21 +1679,25 @@ def render_slideshow_clips(
     height: int = 1080,
     fps: int = 30,
     transition: float = 1.0,
+    scene_seconds: float = 12.0,
 ) -> str:
     """
-    Encadeia múltiplos clipes de vídeo com crossfade (xfade) até a duração
-    exata da narração — usado em documentários para evitar loop único repetido.
+    Encadeia múltiplos clipes de vídeo (e fotos, com Ken Burns) com crossfade
+    (xfade) até a duração exata da narração — usado em documentários para
+    evitar loop único repetido / quadro congelado.
 
-    Cada clipe é normalizado para a mesma resolução/fps/SAR; o resultado tem
+    Cada cena é normalizada para a mesma resolução/fps/SAR; o resultado tem
     fade in/out de 2s no áudio e fade out de 2s no vídeo.
 
     Args:
-        clip_paths: Clipes locais (Pexels). Lista vazia → fundo preto.
+        clip_paths: Clipes locais (Pexels), vídeos ou imagens. Vazio → preto.
         audio_path: Narração que define a duração final.
         output_path: Destino MP4.
         width/height: Resolução do vídeo final.
         fps: Frames por segundo.
-        transition: Duração do crossfade entre clipes, em segundos.
+        transition: Duração do crossfade entre cenas, em segundos.
+        scene_seconds: Duração mínima de cada cena (ajustada para cima se
+            houver poucas cenas; fotos viram cenas Ken Burns com essa duração).
 
     Returns:
         Path do MP4 renderizado.
@@ -1456,28 +1709,58 @@ def render_slideshow_clips(
     if not clip_paths:
         return _render_solid_bg(audio_path, output_path, width, height, duration)
 
+    # cena-alvo dinâmica: cobre o áudio com as cenas disponíveis sem congelar
+    n = len(clip_paths)
+    scene_seconds = max(
+        float(scene_seconds),
+        duration * PEXELS_TARGET_COVERAGE_RATIO / n + transition,
+    )
+
+    _IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
     inputs: List[str] = []
     filter_parts: List[str] = []
+    spans: List[float] = []
     for i, clip in enumerate(clip_paths):
-        inputs += ["-i", clip]
-        filter_parts.append(
-            f"[{i}:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},setsar=1[n{i}]"
-        )
+        is_image = Path(clip).suffix.lower() in _IMG_EXTS
+        if is_image:
+            # foto → cena Ken Burns (zoom lento) com duração fixa
+            span = max(scene_seconds, transition * 2 + 0.5)
+            frames = int(span * fps)
+            inputs += ["-loop", "1", "-t", f"{span:.2f}", "-i", clip]
+            filter_parts.append(
+                f"[{i}:v]scale={width * 2}:{height * 2}:force_original_aspect_ratio=increase,"
+                f"crop={width * 2}:{height * 2},setsar=1,"
+                f"zoompan=z='min(zoom+0.0008,1.25)':x='iw/2-(iw/zoom/2)':"
+                f"y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps},"
+                f"format=yuv420p[n{i}]"
+            )
+        else:
+            span = min(max(get_media_duration(clip), transition * 2 + 0.5),
+                       max(scene_seconds, transition * 2 + 0.5))
+            inputs += ["-ss", "0", "-t", f"{span:.2f}", "-i", clip]
+            filter_parts.append(
+                f"[{i}:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},setsar=1,format=yuv420p[n{i}]"
+            )
+        spans.append(span)
 
-    # Encadeia N clipes distintos com crossfade (sem loop único repetido)
-    chain = "[n0]"
-    acc = 0.0
+    # Encadeia N cenas distintas com crossfade (sem loop único repetido)
     n = len(clip_paths)
-    for i in range(1, n):
-        offset = max(acc + duration / n - transition, 0.0)
-        last = i == n - 1
-        label = "vx" if last else f"m{i}"
-        filter_parts.append(
-            f"{chain}[n{i}]xfade=transition=fade:duration={transition:.2f}:offset={offset:.2f}[{label}]"
-        )
-        chain = f"[{label}]"
-        acc += duration / n - transition
+    if n == 1:
+        chain = "[n0]"
+    else:
+        chain = "[n0]"
+        acc = 0.0
+        for i in range(1, n):
+            offset = max(acc + spans[i - 1] - transition, 0.0)
+            last = i == n - 1
+            label = "vx" if last else f"m{i}"
+            filter_parts.append(
+                f"{chain}[n{i}]xfade=transition=fade:duration={transition:.2f}:offset={offset:.2f}[{label}]"
+            )
+            chain = f"[{label}]"
+            acc += spans[i - 1] - transition
 
     # Se a cadeia terminar antes do áudio, congela o último frame até 'd'
     filter_parts.append(
@@ -1497,7 +1780,7 @@ def render_slideshow_clips(
         "-movflags", "+faststart",
         output_path,
     ]
-    logger.info("Renderizando slideshow de %d clipes (%s)…", n, _fmt_mmss(duration))
+    logger.info("Renderizando slideshow de %d cenas (%s)…", n, _fmt_mmss(duration))
     _run_ffmpeg(args, "slideshow-clips")
     return output_path
 
@@ -1576,6 +1859,20 @@ def _publish_metadata(
 # ===========================================================================
 
 
+def _prepare_documentary_scenes(
+    query_pexels: str, audio_path: str, orientation: str = "landscape"
+) -> List[str]:
+    """Busca pool de vídeos + fotos no Pexels e monta a sequência de cenas."""
+    base = [t.strip() for t in query_pexels.split(",") if t.strip()]
+    queries = base + ["cinematic b roll", "technology abstract", "documentary aerial"]
+    target = get_media_duration(audio_path)
+    plan_videos, plan_images = build_scene_plan(queries, target)
+    clips, photos = fetch_media_pool(plan_videos, plan_images, orientation)
+    scenes = ensure_timeline_coverage(clips, photos, target)
+    logger.info("Cenas preparadas: %d para %s.", len(scenes), _fmt_mmss(target))
+    return scenes
+
+
 def generate_global_video(tema: str, query_pexels: str, duracao: str = "long") -> str:
     """
     Gera vídeo em inglês no estilo documentário de tecnologia/finanças/geopolítica.
@@ -1607,13 +1904,13 @@ def generate_global_video(tema: str, query_pexels: str, duracao: str = "long") -
     synthesize_speech(script, VOICES["GLOBAL"], audio_path)
     logger.info("Duração real do áudio: %s", _fmt_mmss(get_media_duration(audio_path)))
 
-    # 3. B‑roll
+    # 3. B‑roll (múltiplos clipes + fotos, sem loop único)
     logger.info("Etapa 3/5 – Buscando B‑roll…")
-    broll = download_broll(query_pexels, orientation="landscape")
+    scenes = _prepare_documentary_scenes(query_pexels, audio_path)
 
     # 4. Renderização horizontal
     logger.info("Etapa 4/4 – Renderizando vídeo GLOBAL…")
-    render_horizontal(audio_path, broll, output_path, "global")
+    render_slideshow_clips(scenes, audio_path, output_path, width=1920, height=1080)
 
     logger.info("=== VÍDEO GLOBAL CONCLUÍDO → %s ===", output_path)
     return output_path
@@ -1722,13 +2019,13 @@ def generate_brasil_video(
     synthesize_speech(script, VOICES["BRASIL"], audio_path)
     logger.info("Duração real do áudio: %s", _fmt_mmss(get_media_duration(audio_path)))
 
-    # 3. B‑roll
+    # 3. B‑roll (múltiplos clipes + fotos, sem loop único)
     logger.info("Etapa 3/5 – Buscando B‑roll…")
-    broll = download_broll(query_pexels, orientation="landscape")
+    scenes = _prepare_documentary_scenes(query_pexels, audio_path)
 
     # 4. Renderização horizontal
     logger.info("Etapa 4/5 – Renderizando vídeo BRASIL…")
-    render_horizontal(audio_path, broll, output_path, "brasil")
+    render_slideshow_clips(scenes, audio_path, output_path, width=1920, height=1080)
 
     # 5. Metadados + thumbnail
     logger.info("Etapa 5/5 – Gerando metadados e thumbnail BRASIL…")
@@ -1974,7 +2271,7 @@ def generate_shopee_video(
     # 4. Clipes de fundo genéricos do Pexels (multi-camada, ~40% opacidade)
     logger.info("Etapa 4/6 – Buscando clipes de fundo no Pexels…")
     queries = _build_background_queries(nome, descricao)
-    bg_clips = download_brolls(queries, count=3, orientation="portrait")
+    bg_clips = download_brolls(queries, count=4, orientation="portrait")
 
     # 5. Renderização cinematográfica vertical 9:16
     logger.info("Etapa 5/6 – Renderizando vídeo SHOPEE cinematográfico…")

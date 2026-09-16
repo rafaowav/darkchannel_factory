@@ -307,18 +307,28 @@ async def stage_render(job_id: str) -> None:
 
 
 async def _render_documentary(job, folder, tipo_engine: str, audio_sec: float, video_path: str) -> str:
-    """16:9 com B-roll variado (múltiplos clipes encadeados, sem loop único)."""
-    from engine import render_slideshow_clips
-    from services.render_service import download_background_clips
+    """16:9 com B-roll variado (vídeos + fotos Pexels cobrindo todo o áudio)."""
+    from engine import (
+        build_scene_plan, ensure_timeline_coverage, fetch_media_pool,
+        render_slideshow_clips,
+    )
 
     query = job.payload.get("query_pexels") or job.title
     base = [t.strip() for t in query.split(",") if t.strip()]
-    queries = (base + [query, "technology abstract", "cinematic b roll"])[:4]
-    clips = await download_background_clips(queries, count=3, orientation="landscape")
-    if not clips:
+    queries = base + ["cinematic b roll", "technology abstract", "documentary aerial"]
+    plan_videos, plan_images = build_scene_plan(queries, audio_sec)
+    clips, photos = await asyncio.to_thread(
+        fetch_media_pool, plan_videos, plan_images, "landscape"
+    )
+    scenes = ensure_timeline_coverage(clips, photos, audio_sec)
+    if not scenes:
         raise RuntimeError("Nenhum clipe de B-roll disponível (Pexels offline/vazio).")
+    logger.info(
+        "Timeline do documentário: %d cenas (%d vídeos + %d fotos) para %.0fs.",
+        len(scenes), len(clips), len(photos), audio_sec,
+    )
     return await asyncio.to_thread(
-        render_slideshow_clips, clips, str(folder.narration_mp3), video_path,
+        render_slideshow_clips, scenes, str(folder.narration_mp3), video_path,
         width=1920, height=1080, fps=30, transition=1.0,
     )
 
@@ -334,7 +344,7 @@ async def _render_shopee(job, folder, script: str, audio_sec: float, video_path:
     images = await download_product_images_from_snap(job, folder)
     cards = await build_cards(images)
     queries = _bg_queries_for(snap.get("name", job.title))
-    clips = await download_background_clips(queries, count=3, orientation="portrait")
+    clips = await download_background_clips(queries, count=4, orientation="portrait")
     price_str = f"R$ {snap.get('price', 0):.2f}".replace(".", ",") if snap.get("price") else ""
     return await render_shopee_reel(
         cards, clips, str(folder.narration_mp3), video_path,
