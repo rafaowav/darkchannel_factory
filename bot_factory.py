@@ -109,6 +109,11 @@ class ShopeeFlow(StatesGroup):
     duration = State()
 
 
+class TikTokFlow(StatesGroup):
+    tema = State()
+    legendas = State()
+
+
 class BatchFlow(StatesGroup):
     kind = State()
     temas_global = State()
@@ -202,6 +207,7 @@ async def create_job(
         JobType.GLOBAL_LONG: "GLB",
         JobType.BRASIL_LONG: "BR",
         JobType.SHOPEE_SHORT: "SP",
+        JobType.TIKTOK_SHORT: "TT",
     }[job_type]
     job_id = next_job_id(prefix)
     db = get_db()
@@ -275,6 +281,11 @@ async def cb_new(query: CallbackQuery, state: FSMContext) -> None:
     if not await deny_unless_admin_cb(query):
         return
     kind = query.data.split(":", 1)[1]
+    if kind == "tiktok_short":
+        await state.set_state(TikTokFlow.tema.state)
+        await query.message.edit_text("Digite o <b>tema</b> do TikTok (até 15s):")  # type: ignore[union-attr]
+        await query.answer()
+        return
     await query.message.edit_text("Digite o <b>tema</b> do vídeo:")  # type: ignore[union-attr]
     if kind == "global_long":
         await state.set_state(GlobalFlow.tema.state)
@@ -555,6 +566,37 @@ async def _finish_brasil(chat_id: int, tema: str, produtos: List[Dict[str, Any]]
 # ---------------------------------------------------------------------------
 
 
+@dp.message(TikTokFlow.tema, F.text)
+async def tiktok_tema(message: Message, state: FSMContext) -> None:
+    if not is_admin(message):
+        return
+    tema = message.text.strip()
+    await state.update_data(tema=tema)
+    await state.set_state(TikTokFlow.legendas.state)
+    await message.answer(
+        f"Tema: <i>{tema}</i>\n\nIncluir legendas no vídeo?",
+        reply_markup=K.subtitle_choices(),
+    )
+
+
+@dp.callback_query(TikTokFlow.legendas, F.data.startswith("subs:"))
+async def tiktok_subs(query: CallbackQuery, state: FSMContext) -> None:
+    if not await deny_unless_admin_cb(query):
+        return
+    with_subs = query.data.split(":", 1)[1] == "sim"
+    data = await state.get_data()
+    tema = data["tema"]
+    job_id = await create_job(
+        JobType.TIKTOK_SHORT, tema,
+        {"tema": tema, "query_pexels": tema, "with_subtitles": with_subs},
+    )
+    await state.clear()
+    await query.message.edit_text(  # type: ignore[union-attr]
+        f"🎵 <b>Job {job_id}</b> criado (TikTok ≤15s, legendas={'on' if with_subs else 'off'})."
+    )
+    await query.answer()
+
+
 @dp.message(ShopeeFlow.entrada, F.text)
 async def shopee_entrada(message: Message, state: FSMContext) -> None:
     if not is_admin(message):
@@ -730,6 +772,28 @@ async def cmd_shopee(message: Message, command: CommandObject) -> None:
     await message.answer(f"🛍️ Job {job_id} criado.")
 
 
+@dp.message(Command("voz"))
+async def cmd_voz(message: Message, command: CommandObject) -> None:
+    if not is_admin(message):
+        return
+    from engine import TTS_ENGINE as atual
+
+    alvo = (command.args or "").strip().lower()
+    if not alvo:
+        await message.answer(
+            f"Motor de voz atual: <b>{atual}</b>\n\n"
+            "Uso: /voz edge  |  /voz piper"
+        )
+        return
+    try:
+        from engine import set_tts_engine
+
+        novo = set_tts_engine(alvo)
+        await message.answer(f"🔊 Motor de voz alterado para: <b>{novo}</b>")
+    except Exception as exc:
+        await message.answer(f"❌ {redact_secrets(str(exc))}")
+
+
 @dp.message(Command("shopee_url"))
 async def cmd_shopee_url(message: Message, command: CommandObject) -> None:
     if not is_admin(message):
@@ -741,6 +805,21 @@ async def cmd_shopee_url(message: Message, command: CommandObject) -> None:
     job_id = await create_job(JobType.SHOPEE_SHORT, url[:60],
                               {"url": url, "duracion_seconds": 30})
     await message.answer(f"🛍️ Job {job_id} criado.")
+
+
+@dp.message(Command("tiktok"))
+async def cmd_tiktok(message: Message, command: CommandObject) -> None:
+    if not is_admin(message):
+        return
+    tema = (command.args or "").strip()
+    if not tema:
+        await message.answer("Uso: /tiktok <tema> — ou menu guiado: /novo")
+        return
+    job_id = await create_job(
+        JobType.TIKTOK_SHORT, tema,
+        {"tema": tema, "query_pexels": tema, "with_subtitles": True},
+    )
+    await message.answer(f"🎵 Job {job_id} criado (TikTok ≤15s).")
 
 
 @dp.message(Command("lote_semana"))

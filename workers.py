@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -59,6 +60,23 @@ def _job_or_raise(job_id: str):  # type: ignore[no-untyped-def]
 # ===========================================================================
 
 
+_TIKTOK_PART_RE = re.compile(r"\[\s*PARTE\s*(\d+)\s*\]", re.IGNORECASE)
+
+
+def _split_tiktok_parts(script: str) -> List[str]:
+    marks = list(_TIKTOK_PART_RE.finditer(script))
+    if not marks:
+        return [script.strip()] if script.strip() else []
+    parts: List[str] = []
+    for i, m in enumerate(marks):
+        start = m.end()
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(script)
+        chunk = script[start:end].strip()
+        if chunk:
+            parts.append(chunk)
+    return parts
+
+
 async def stage_research(job_id: str) -> None:
     db = get_db()
     job = _job_or_raise(job_id)
@@ -68,14 +86,20 @@ async def stage_research(job_id: str) -> None:
     folder.write_input({"job_id": job.id, "type": job.type, "title": job.title,
                         "payload": job.payload, "created_at": job.created_at})
 
-    tipo_engine = "shopee" if job.type == JobType.SHOPEE_SHORT.value else \
-        ("global" if job.type == JobType.GLOBAL_LONG.value else "brasil")
+    if job.type == JobType.SHOPEE_SHORT.value:
+        tipo_engine = "shopee"
+    elif job.type == JobType.TIKTOK_SHORT.value:
+        tipo_engine = "tiktok"
+    elif job.type == JobType.GLOBAL_LONG.value:
+        tipo_engine = "global"
+    else:
+        tipo_engine = "brasil"
     tema = job.payload.get("tema") or job.title
 
-    # ---- briefing (não aplica a reels Shopee; lá o snapshot substitui) ----
+    # ---- briefing (não aplica a reels Shopee/TikTok; lá o snapshot substitui) ----
     produtos_payload: List[Dict[str, Any]] = job.payload.get("produtos", [])
     research_text = ""
-    if tipo_engine != "shopee":
+    if tipo_engine not in ("shopee", "tiktok"):
         from services.research_service import build_briefing
 
         await notify(job_id, "🔎 Pesquisando briefing…")
@@ -133,7 +157,7 @@ async def stage_research(job_id: str) -> None:
                 db.save_product_snapshot(job_id, s)
 
     # ---- roteiro validado ----
-    duracao = {"global": "long", "brasil": "long", "shopee": "reel"}[tipo_engine]
+    duracao = {"global": "long", "brasil": "long", "shopee": "reel", "tiktok": "micro"}[tipo_engine]
     tema_prompt = tema
     if tipo_engine == "shopee" and extras:
         facts = [f"DADOS REAIS DA API (use SOMENTE estes números):\n"
@@ -174,6 +198,32 @@ async def stage_research(job_id: str) -> None:
             await notify(job_id, f"❌ Falha ao gerar roteiro: {redact_secrets(str(exc))}")
         return
 
+    if tipo_engine == "tiktok":
+        parts = _split_tiktok_parts(script)
+    else:
+        parts = [script.strip()]
+
+    if len(parts) > 1:
+        for i, part in enumerate(parts):
+            pf = folder.path / f"part_{i + 1}.txt"
+            pf.write_text(part, encoding="utf-8")
+        joined = "\n\n".join(f"[PARTE {i + 1}]\n{p}" for i, p in enumerate(parts))
+        folder.write_script(joined)
+        words_total = sum(len(p.split()) for p in parts)
+        est_total = words_total / WORDS_PER_MINUTE * 60
+        db.update_payload(
+            job_id, word_count=words_total, est_seconds=est_total,
+            script_path=str(folder.script_txt), tiktok_parts=len(parts),
+        )
+        db.update_status(job_id, JobStatus.AWAITING_SCRIPT_APPROVAL.value)
+        sizes = ", ".join(str(len(p.split())) + "w" for p in parts)
+        await notify(
+            job_id,
+            f"Série TikTok pronta: {len(parts)} partes ({sizes}).\n"
+            f"Total ~{format_duration(est_total)}. Cada parte será um vídeo separado de ≤15s.",
+        )
+        return
+
     words, est_sec = script_stats(script)
     folder.write_script(script)
     db.update_payload(job_id, word_count=words, est_seconds=est_sec, script_path=str(folder.script_txt))
@@ -202,8 +252,14 @@ async def stage_render(job_id: str) -> None:
     db.update_status(job.id, JobStatus.RENDERING.value)
     await notify(job_id, "🎞️ Renderizando… (fila ativa: use /status)")
 
-    tipo_engine = "shopee" if job.type == JobType.SHOPEE_SHORT.value else \
-        ("global" if job.type == JobType.GLOBAL_LONG.value else "brasil")
+    if job.type == JobType.SHOPEE_SHORT.value:
+        tipo_engine = "shopee"
+    elif job.type == JobType.TIKTOK_SHORT.value:
+        tipo_engine = "tiktok"
+    elif job.type == JobType.GLOBAL_LONG.value:
+        tipo_engine = "global"
+    else:
+        tipo_engine = "brasil"
 
     script = folder.script_txt.read_text(encoding="utf-8")
 
@@ -235,6 +291,8 @@ async def stage_render(job_id: str) -> None:
 
     if tipo_engine == "shopee":
         video_out = await _render_shopee(job, folder, script, audio_sec, video_path)
+    elif tipo_engine == "tiktok":
+        video_out = await _render_tiktok(job, folder, script, audio_sec, video_path)
     else:
         video_out = await _render_documentary(job, folder, tipo_engine, audio_sec, video_path)
 
@@ -307,15 +365,15 @@ async def stage_render(job_id: str) -> None:
 
 
 async def _render_documentary(job, folder, tipo_engine: str, audio_sec: float, video_path: str) -> str:
-    """16:9 com B-roll variado (vídeos + fotos Pexels cobrindo todo o áudio)."""
+    """16:9 com B-roll relevante ao roteiro (vídeos + fotos Pexels)."""
     from engine import (
         build_scene_plan, ensure_timeline_coverage, fetch_media_pool,
         render_slideshow_clips,
     )
 
-    query = job.payload.get("query_pexels") or job.title
-    base = [t.strip() for t in query.split(",") if t.strip()]
-    queries = base + ["cinematic b roll", "technology abstract", "documentary aerial"]
+    script = folder.script_txt.read_text(encoding="utf-8")
+    tema = job.payload.get("tema") or job.title
+    queries = await _visual_queries(script, tema)
     plan_videos, plan_images = build_scene_plan(queries, audio_sec)
     clips, photos = await asyncio.to_thread(
         fetch_media_pool, plan_videos, plan_images, "landscape"
@@ -331,6 +389,124 @@ async def _render_documentary(job, folder, tipo_engine: str, audio_sec: float, v
         render_slideshow_clips, scenes, str(folder.narration_mp3), video_path,
         width=1920, height=1080, fps=30, transition=1.0,
     )
+
+
+def _tiktok_part_scripts(folder, script: str) -> List[str]:
+    parts_files = sorted(folder.path.glob("part_*.txt"))
+    if parts_files:
+        return [p.read_text(encoding="utf-8").strip() for p in parts_files if p.read_text(encoding="utf-8").strip()]
+    return _split_tiktok_parts(script) or [script.strip()]
+
+
+async def _render_tiktok(job, folder, script: str, audio_sec: float, video_path: str) -> str:
+    """9:16 até 15s; gera um vídeo por parte quando há série TikTok."""
+    from engine import build_scene_plan, fetch_media_pool
+    from services.render_service import download_background_clips
+
+    tema = job.payload.get("tema") or job.title
+    with_subs = bool(job.payload.get("with_subtitles", True))
+
+    parts = _tiktok_part_scripts(folder, script)
+    if len(parts) > 1:
+        outs: List[str] = []
+        stem = Path(video_path).stem
+        parent = Path(video_path).parent
+        for idx, part in enumerate(parts):
+            out_i = str(parent / f"{stem}_p{idx + 1}.mp4")
+            audio_i = await _tiktok_audio(job, folder, part, idx + 1)
+            sec_i = get_media_duration(audio_i)
+            media = await _tiktok_media(part, tema, sec_i,
+                                        build_scene_plan, fetch_media_pool,
+                                        download_background_clips)
+            await asyncio.to_thread(
+                _tiktok_render, media, audio_i, out_i,
+                tema, min(sec_i, 15.0), with_subs,
+            )
+            outs.append(out_i)
+            db.register_asset(job.id, "video", out_i)
+        return ";".join(outs)
+
+    media = await _tiktok_media(script, tema, audio_sec,
+                                build_scene_plan, fetch_media_pool,
+                                download_background_clips)
+    if not media:
+        raise RuntimeError(f"Nenhuma mídia encontrada para o tema '{tema}'.")
+    return await asyncio.to_thread(
+        _tiktok_render, media, str(folder.narration_mp3), video_path,
+        tema, min(audio_sec, 15.0), with_subs,
+    )
+
+
+async def _visual_queries(script: str, tema: str) -> List[str]:
+    """Deriva queries visuais concretas por frase do roteiro via Gemini."""
+    from engine import _gemini_generate
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", script) if s.strip()]
+    chunks = []
+    step = max(1, len(sentences) // 8)
+    for i in range(0, len(sentences), step):
+        chunks.append(" ".join(sentences[i:i + step]))
+    if not chunks:
+        chunks = [script[:500]]
+
+    all_qs: List[str] = []
+    for chunk in chunks[:8]:
+        prompt = (
+            "Given this segment of a video narration, extract EXACTLY ONE specific "
+            "English search phrase for stock footage/photo (Pexels API) that VISUALLY "
+            "depicts the MAIN OBJECT or SCENE mentioned. Be literal and concrete:\n"
+            "- 'microwave' → 'microwave oven kitchen'\n"
+            "- 'gamer digitando' → 'hands typing mechanical keyboard dark room'\n"
+            "- 'cidade à noite' → 'city skyline night aerial view'\n"
+            "NO abstract words like 'concept', 'idea', 'cinematic b roll'. "
+            "ONLY physical objects, people, actions, locations visible on screen.\n\n"
+            f"Segment: {chunk}\n\n"
+            "Reply with ONLY the single search phrase, lowercase, nothing else."
+        )
+        try:
+            raw = await asyncio.to_thread(_gemini_generate, prompt)
+            q = raw.strip().strip('"').split("\n")[0].lower()
+            if 3 <= len(q) <= 70:
+                all_qs.append(q)
+        except Exception as exc:
+            logger.warning("Query Gemini falhou: %s", exc)
+            continue
+
+    unique = list(dict.fromkeys(all_qs))
+    if unique:
+        logger.info("Queries visuais por cena: %s", unique)
+        return unique
+
+    base = [t.strip().lower() for t in tema.split(",") if t.strip()]
+    return base or [tema.lower()]
+
+
+async def _tiktok_audio(job, folder, part: str, idx: int) -> str:
+    from engine import VOICES, synthesize_speech
+
+    db = get_db()
+    out_path = str(folder.path / f"narration_p{idx}.mp3")
+    await asyncio.to_thread(synthesize_speech, part, VOICES["TIKTOK"], out_path)
+    db.register_asset(job.id, "audio", out_path)
+    return out_path
+
+
+async def _tiktok_media(script: str, tema: str, target_sec: float,
+                        build_scene_plan, fetch_media_pool, download_background_clips) -> List[str]:
+    from engine import download_brolls
+
+    queries = await _visual_queries(script, tema)
+    clips = await asyncio.to_thread(download_brolls, queries, max(1, int(target_sec // 4)), "portrait")
+    if not clips:
+        clips = await asyncio.to_thread(download_brolls, [tema], 3, "portrait")
+    return clips or []
+
+
+def _tiktok_render(media, audio, out, theme, dur, subs):
+    from engine import render_slideshow_clips
+
+    scenes = [(p, None) for p in media]
+    return render_slideshow_clips(scenes, audio, out, width=1080, height=1920, fps=30, transition=0.5)
 
 
 async def _render_shopee(job, folder, script: str, audio_sec: float, video_path: str) -> str:

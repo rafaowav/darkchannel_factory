@@ -19,6 +19,7 @@ class JobType(str, enum.Enum):
     GLOBAL_LONG = "global_long"
     BRASIL_LONG = "brasil_long"
     SHOPEE_SHORT = "shopee_short"
+    TIKTOK_SHORT = "tiktok_short"
 
 
 class JobStatus(str, enum.Enum):
@@ -142,6 +143,7 @@ SCRIPT_LIMITS: Dict[JobType, tuple] = {
     JobType.GLOBAL_LONG: (1300, 1800),
     JobType.BRASIL_LONG: (1200, 1500),
     JobType.SHOPEE_SHORT: (60, 90),
+    JobType.TIKTOK_SHORT: (25, 120),
 }
 
 

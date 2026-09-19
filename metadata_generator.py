@@ -483,6 +483,39 @@ def _metadata_shopee(tema: str, roteiro: str, extras: Optional[Dict[str, Any]] =
     }
 
 
+def _metadata_tiktok(tema: str, roteiro: str) -> Dict[str, Any]:
+    """Metadados para cortes curtos de TikTok/Shorts (PT-BR)."""
+    ai = _gemini_metadata("brasil", tema, roteiro)
+    titulo = _truncate_title(ai.get("titulo") or tema.title(), limit=70)
+
+    resumo = (ai.get("resumo") or " ".join(roteiro.split()[:30])).strip()
+    hashtags = _extract_keywords(roteiro, limit=5)
+    tag_line = " ".join("#" + re.sub(r"[^a-z0-9]", "", t) for t in hashtags)
+
+    descricao_parts = [
+        resumo,
+        "",
+        tag_line,
+        "#tiktok #viral #fyp #curiosidades",
+    ]
+
+    tags = ["tiktok", "shorts", "viral", "fyp", tema.lower()]
+    tags += hashtags
+    unique_tags: List[str] = []
+    for t in tags:
+        t = re.sub(r"\s+", " ", t.strip().lower())
+        if t and len(t) > 2 and t not in unique_tags:
+            unique_tags.append(t)
+
+    return {
+        "titulo": titulo,
+        "descricao": "\n".join(descricao_parts),
+        "tags": unique_tags[:15],
+        "categoria": "Education",
+        "idioma": "pt-BR",
+    }
+
+
 # ---------------------------------------------------------------------------
 # API pública
 # ---------------------------------------------------------------------------
@@ -519,8 +552,10 @@ def generate_video_metadata(
         meta = _metadata_brasil(tema_ou_produto, roteiro, produtos)
     elif tipo == "shopee":
         meta = _metadata_shopee(tema_ou_produto, roteiro, extras)
+    elif tipo == "tiktok":
+        meta = _metadata_tiktok(tema_ou_produto, roteiro)
     else:
-        raise ValueError(f"tipo_video inválido: {tipo_video!r} (use global|brasil|shopee)")
+        raise ValueError(f"tipo_video inválido: {tipo_video!r} (use global|brasil|shopee|tiktok)")
 
     logger.info(
         "Metadata %s → título: '%s' (%d chars), %d tags",
@@ -648,7 +683,7 @@ def generate_thumbnail(
         Path da thumbnail salva.
     """
     tipo = tipo_video.strip().lower()
-    if tipo not in ("global", "brasil", "shopee"):
+    if tipo not in ("global", "brasil", "shopee", "tiktok"):
         raise ValueError(f"tipo_video inválido: {tipo_video!r}")
 
     if output_path is None:
@@ -698,6 +733,32 @@ def generate_thumbnail(
         for line in lines:
             _draw_centered_text(draw, line, phrase_font, y, "white", stroke_width=6, stroke_fill="black")
             y += 120
+
+    elif tipo == "tiktok":
+        draw.rectangle([0, 0, THUMB_W, THUMB_H], fill=(18, 18, 24))
+        for x in range(0, THUMB_W, 160):
+            draw.line([(x, 0), (x + 120, THUMB_H)], fill=(35, 35, 45), width=6)
+        accent = (37, 244, 238)
+        pink = (254, 44, 85)
+        draw.rectangle([0, 0, THUMB_W, 16], fill=accent)
+        draw.rectangle([0, THUMB_H - 16, THUMB_W, THUMB_H], fill=pink)
+        if imagem_fundo and Path(imagem_fundo).exists():
+            try:
+                icon = Image.open(imagem_fundo).convert("RGBA")
+                icon.thumbnail((320, 320), Image.LANCZOS)
+                canvas.paste(icon, ((THUMB_W - icon.width) // 2, 90), icon)
+                draw = ImageDraw.Draw(canvas)
+            except Exception as exc:
+                logger.warning("Falha ao usar ícone na thumb tiktok: %s", exc)
+        lines = textwrap.wrap(short, width=12)[:3]
+        y = THUMB_H - 80 - (len(lines) - 1) * 110
+        for i, line in enumerate(lines):
+            col = accent if i % 2 == 0 else "white"
+            _draw_centered_text(draw, line, phrase_font, y, col, stroke_width=6, stroke_fill="black")
+            y += 110
+        draw.rounded_rectangle([24, 24, 300, 104], radius=18, fill=pink)
+        badge_font = _load_font(44)
+        draw.text((162, 64), "TIKTOK", font=badge_font, fill="white", anchor="mm")
 
     else:  # shopee
         # Fundo: imagem do produto desfocada; destaque ACHADINHO amarelo + preço verde

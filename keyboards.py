@@ -27,8 +27,9 @@ def kb(rows: List[List[tuple]]) -> InlineKeyboardMarkup:
 def main_menu() -> InlineKeyboardMarkup:
     return kb([
         [("🌍 Global longo", "new:global_long")],
-        [("🇧🇷 Brasil longo", "new:brasil_long")],
+        [("🇧 Brasil longo", "new:brasil_long")],
         [("🛍️ Shopee Produto", "new:shopee_short")],
+        [("🎵 TikTok (≤15s)", "new:tiktok_short")],
         [("📦 Lote semanal", "batch:start")],
         [("📊 Painel", "nav:painel")],
     ])
@@ -66,6 +67,12 @@ def product_picker(product_ids: List[int], selected: List[int], min_sel: int = 2
 def duration_choices() -> InlineKeyboardMarkup:
     return kb([
         [("30s", "dur:30"), ("60s", "dur:60"), ("90s", "dur:90")],
+    ])
+
+
+def subtitle_choices() -> InlineKeyboardMarkup:
+    return kb([
+        [("✅ Com legendas", "subs:sim"), ("❌ Sem legendas", "subs:nao")],
     ])
 
 

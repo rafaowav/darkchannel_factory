@@ -75,6 +75,7 @@ VOICES: Dict[str, str] = {
     "GLOBAL": "en-US-ChristopherNeural",
     "BRASIL": "pt-BR-AntonioNeural",
     "SHOPEE": "pt-BR-FranciscaNeural",
+    "TIKTOK": "pt-BR-ThalitaMultilingualNeural",
 }
 
 AFILIADOS_PATH = BASE_DIR / "afiliados.json"
@@ -988,9 +989,24 @@ Regras:
         """.strip()
         min_w, max_w = 150, 260
 
+    elif tipo == "tiktok" or duracao == "micro":
+        prompt = f"""
+Roteiro TIKTOK de 25-40 SEGUNDOS (80-110 palavras) sobre: {tema}.
+
+Estrutura:
+- [0:00-0:03] Gancho forte e direto (pergunta, fato chocante ou curiosidade)
+- [0:03-0:15] Contexto rapido + dado concreto
+- [0:15-0:30] Solucao ou insight principal
+- [0:30-0:38] CTA curto ("segue pra mais", "comenta ai")
+
+Tom: dinamico, informal, frases curtas. MAXIMO 110 palavras.
+Escreva APENAS o texto da narracao, sem direcoes de cena.
+        """.strip()
+        min_w, max_w = 70, 120
+
     elif duracao == "reel" or tipo == "shopee":
         prompt = f"""
-Copy de 25-35 SEGUNDOS (70-90 palavras) para Shopee Vídeo sobre: {tema}.
+Copy de 25-35 SEGUNDOS (70-90 palavras) para Shopee Video sobre: {tema}.
 
 Estrutura:
 - [0:00-0:03] Gancho: "Olha esse achadinho!"
