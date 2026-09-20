@@ -14,6 +14,7 @@ import logging
 import re
 import shutil
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from database import get_db
@@ -209,6 +210,8 @@ async def stage_research(job_id: str) -> None:
             pf.write_text(part, encoding="utf-8")
         joined = "\n\n".join(f"[PARTE {i + 1}]\n{p}" for i, p in enumerate(parts))
         folder.write_script(joined)
+        from engine import WORDS_PER_MINUTE
+
         words_total = sum(len(p.split()) for p in parts)
         est_total = words_total / WORDS_PER_MINUTE * 60
         db.update_payload(
@@ -222,6 +225,12 @@ async def stage_research(job_id: str) -> None:
             f"Série TikTok pronta: {len(parts)} partes ({sizes}).\n"
             f"Total ~{format_duration(est_total)}. Cada parte será um vídeo separado de ≤15s.",
         )
+        for i, part in enumerate(parts, start=1):
+            pf = folder.path / f"script_part_{i}.txt"
+            if pf.exists():
+                await send_artifact(job_id, str(pf), f"📄 Roteiro parte {i}/{len(parts)}")
+        if _send_fn:
+            await _send_fn("script_approval", {"job_id": job_id})
         return
 
     words, est_sec = script_stats(script)
@@ -262,25 +271,27 @@ async def stage_render(job_id: str) -> None:
         tipo_engine = "brasil"
 
     script = folder.script_txt.read_text(encoding="utf-8")
+    from engine import get_media_duration, VOICES
 
-    # ---- áudio ----
-    from engine import VOICES
-    from services.render_service import synthesize
+    is_tiktok_series = tipo_engine == "tiktok" and len(_tiktok_part_scripts(folder, script)) > 1
 
-    await synthesize(script, VOICES[tipo_engine.upper()], str(folder.narration_mp3))
-    from engine import get_media_duration
+    audio_sec = 0.0
+    if not is_tiktok_series:
+        # ---- áudio ----
+        from services.render_service import synthesize
 
-    audio_sec = get_media_duration(str(folder.narration_mp3))
-    db.register_asset(job_id, "audio", str(folder.narration_mp3))
-    logger.info("Áudio real: %.0fs", audio_sec)
+        await synthesize(script, VOICES[tipo_engine.upper()], str(folder.narration_mp3))
+        audio_sec = get_media_duration(str(folder.narration_mp3))
+        db.register_asset(job_id, "audio", str(folder.narration_mp3))
+        logger.info("Áudio real: %.0fs", audio_sec)
 
-    # ---- SRT ----
-    from services.script_service import build_srt
+        # ---- SRT ----
+        from services.script_service import build_srt
 
-    srt = build_srt(script, audio_sec)
-    if srt:
-        folder.write_text(folder.subtitles_srt, srt)
-        db.register_asset(job_id, "srt", str(folder.subtitles_srt))
+        srt = build_srt(script, audio_sec)
+        if srt:
+            folder.write_text(folder.subtitles_srt, srt)
+            db.register_asset(job_id, "srt", str(folder.subtitles_srt))
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     from engine import normalize_filename
@@ -296,7 +307,10 @@ async def stage_render(job_id: str) -> None:
     else:
         video_out = await _render_documentary(job, folder, tipo_engine, audio_sec, video_path)
 
-    db.register_asset(job_id, "video", video_out)
+    part_list = video_out.split(";") if ";" in video_out else [video_out]
+    for p in part_list:
+        db.register_asset(job_id, "video", p)
+    video_first = part_list[0]
 
     try:
         # ---- metadata + thumbnail ----
@@ -336,15 +350,16 @@ async def stage_render(job_id: str) -> None:
             "gerado_em": utcnow_iso(),
         }
         folder.write_metadata(metadata_doc)
-        db.update_payload(job_id, video_path=video_out, metadata=meta, audio_seconds=audio_sec)
+        db.update_payload(job_id, video_path=video_first, video_parts=part_list,
+                          metadata=meta, audio_seconds=audio_sec)
 
         words = len(script.split())
-        review = build_review_markdown(job_id, meta, video_out, audio_sec, words,
+        review = build_review_markdown(job_id, meta, video_first, audio_sec, words,
                                        job.payload.get("product_snapshots"))
         folder.write_review(review)
     except Exception as exc:
         logger.exception("Metadados/thumbnail falharam para %s (vídeo preservado)", job_id)
-        db.update_payload(job_id, video_path=video_out)
+        db.update_payload(job_id, video_path=video_first, video_parts=part_list)
         folder.write_text(
             folder.review_md,
             f"# Review — {job_id}\n\nVídeo OK, mas metadados falharam: "
@@ -355,8 +370,14 @@ async def stage_render(job_id: str) -> None:
     db.update_status(job_id, JobStatus.RENDERED.value)
     db.update_status(job_id, JobStatus.REVIEW_REQUIRED.value)
 
-    await notify(job_id, f"✅ Render concluído ({audio_sec / 60:.1f} min): {video_name}")
-    await send_artifact(job_id, video_out, f"🎬 {job_id} preview")
+    total_min = sum(get_media_duration(p) for p in part_list) / 60
+    await notify(
+        job_id,
+        f"✅ Render concluído ({len(part_list)} parte(s), {total_min:.1f} min total): {video_name}",
+    )
+    for i, p in enumerate(part_list, start=1):
+        label = f"parte {i}/{len(part_list)}" if len(part_list) > 1 else "preview"
+        await send_artifact(job_id, p, f"🎬 {job_id} {label}")
     if meta:
         await send_artifact(job_id, str(folder.thumbnail_jpg), f"🖼️ Thumbnail {job_id}")
     await send_artifact(job_id, str(folder.review_md), f"📋 Review {job_id}")
@@ -398,42 +419,74 @@ def _tiktok_part_scripts(folder, script: str) -> List[str]:
     return _split_tiktok_parts(script) or [script.strip()]
 
 
-async def _render_tiktok(job, folder, script: str, audio_sec: float, video_path: str) -> str:
-    """9:16 até 15s; gera um vídeo por parte quando há série TikTok."""
-    from engine import build_scene_plan, fetch_media_pool
-    from services.render_service import download_background_clips
+TIKTOK_MAX_PART_SECONDS: float = 15.0
 
+
+def _trim_to_max(text: str, max_words: int) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    trimmed = " ".join(words[:max_words]).rstrip(",;:") + "."
+    logger.warning("Parte TikTok truncada para %d palavras.", max_words)
+    return trimmed
+
+
+async def _render_tiktok(job, folder, script: str, audio_sec: float, video_path: str) -> str:
+    """9:16; série de até 3 partes de ≤15s cada, do mesmo tema."""
+    from engine import get_media_duration
     tema = job.payload.get("tema") or job.title
     with_subs = bool(job.payload.get("with_subtitles", True))
+    db = get_db()
 
-    parts = _tiktok_part_scripts(folder, script)
+    parts = _tiktok_part_scripts(folder, script)[:3]
+    max_w = int(TIKTOK_MAX_PART_SECONDS * 150 / 60) - 3
+    parts = [_trim_to_max(p, max_w) for p in parts if p.strip()]
+
     if len(parts) > 1:
         outs: List[str] = []
         stem = Path(video_path).stem
         parent = Path(video_path).parent
         for idx, part in enumerate(parts):
+            await notify(job.id, f"🎞️ Renderizando parte {idx + 1}/{len(parts)}…")
             out_i = str(parent / f"{stem}_p{idx + 1}.mp4")
             audio_i = await _tiktok_audio(job, folder, part, idx + 1)
-            sec_i = get_media_duration(audio_i)
-            media = await _tiktok_media(part, tema, sec_i,
-                                        build_scene_plan, fetch_media_pool,
-                                        download_background_clips)
-            await asyncio.to_thread(
-                _tiktok_render, media, audio_i, out_i,
-                tema, min(sec_i, 15.0), with_subs,
-            )
+            sec_i = min(get_media_duration(audio_i), TIKTOK_MAX_PART_SECONDS)
+            media = await _tiktok_media(part, tema, sec_i)
+            if not media:
+                raise RuntimeError(f"Nenhuma mídia para a parte {idx + 1} do tema '{tema}'.")
+            srt_i = str(folder.path / f"subs_p{idx + 1}.srt")
+            if with_subs:
+                from services.script_service import build_srt
+                srt_content = build_srt(part, sec_i)
+                if srt_content:
+                    Path(srt_i).write_text(srt_content, encoding="utf-8")
+                    db.register_asset(job.id, "srt", srt_i)
+                    await asyncio.to_thread(
+                        _tiktok_render, media, audio_i, out_i,
+                        tema, sec_i, with_subs, srt_i,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        _tiktok_render, media, audio_i, out_i,
+                        tema, sec_i, with_subs, None,
+                    )
+            else:
+                await asyncio.to_thread(
+                    _tiktok_render, media, audio_i, out_i,
+                    tema, sec_i, False, None,
+                )
             outs.append(out_i)
             db.register_asset(job.id, "video", out_i)
         return ";".join(outs)
 
-    media = await _tiktok_media(script, tema, audio_sec,
-                                build_scene_plan, fetch_media_pool,
-                                download_background_clips)
+    part = parts[0] if parts else script
+    media = await _tiktok_media(part, tema, min(audio_sec, TIKTOK_MAX_PART_SECONDS))
     if not media:
         raise RuntimeError(f"Nenhuma mídia encontrada para o tema '{tema}'.")
     return await asyncio.to_thread(
         _tiktok_render, media, str(folder.narration_mp3), video_path,
-        tema, min(audio_sec, 15.0), with_subs,
+        tema, min(audio_sec, TIKTOK_MAX_PART_SECONDS), with_subs,
+        str(folder.subtitles_srt) if with_subs and folder.subtitles_srt.exists() else None,
     )
 
 
@@ -491,22 +544,21 @@ async def _tiktok_audio(job, folder, part: str, idx: int) -> str:
     return out_path
 
 
-async def _tiktok_media(script: str, tema: str, target_sec: float,
-                        build_scene_plan, fetch_media_pool, download_background_clips) -> List[str]:
+async def _tiktok_media(script: str, tema: str, target_sec: float) -> List[str]:
     from engine import download_brolls
 
+    n_clips = max(2, min(4, int(target_sec // 4) + 1))
     queries = await _visual_queries(script, tema)
-    clips = await asyncio.to_thread(download_brolls, queries, max(1, int(target_sec // 4)), "portrait")
+    clips = await asyncio.to_thread(download_brolls, queries, n_clips, "portrait")
     if not clips:
-        clips = await asyncio.to_thread(download_brolls, [tema], 3, "portrait")
+        clips = await asyncio.to_thread(download_brolls, [tema], n_clips, "portrait")
     return clips or []
 
 
-def _tiktok_render(media, audio, out, theme, dur, subs):
-    from engine import render_slideshow_clips
+def _tiktok_render(media, audio, out, theme, dur, subs, srt_path=None):
+    from engine import render_tiktok_part
 
-    scenes = [(p, None) for p in media]
-    return render_slideshow_clips(scenes, audio, out, width=1080, height=1920, fps=30, transition=0.5)
+    return render_tiktok_part(media, audio, out, dur, subtitle_srt=srt_path)
 
 
 async def _render_shopee(job, folder, script: str, audio_sec: float, video_path: str) -> str:

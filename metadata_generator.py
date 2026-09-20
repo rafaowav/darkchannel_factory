@@ -485,7 +485,7 @@ def _metadata_shopee(tema: str, roteiro: str, extras: Optional[Dict[str, Any]] =
 
 def _metadata_tiktok(tema: str, roteiro: str) -> Dict[str, Any]:
     """Metadados para cortes curtos de TikTok/Shorts (PT-BR)."""
-    ai = _gemini_metadata("brasil", tema, roteiro)
+    ai = _gemini_metadata("brasil", tema, roteiro) or {}
     titulo = _truncate_title(ai.get("titulo") or tema.title(), limit=70)
 
     resumo = (ai.get("resumo") or " ".join(roteiro.split()[:30])).strip()

@@ -21,6 +21,7 @@ import requests
 from dotenv import load_dotenv
 from google import genai
 from google.api_core import exceptions as google_exceptions
+from groq import Groq
 from mutagen.mp3 import MP3
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,7 @@ for _d in (ASSETS_DIR, BROLL_DIR, AUDIO_DIR, OUTPUT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 PEXELS_API_KEY: str = os.getenv("PEXELS_API_KEY", "")
 
 if not GEMINI_API_KEY:
@@ -62,13 +64,28 @@ client: Optional[genai.Client] = None
 # - gemini-flash-latest: alias que sempre aponta para a versão estável mais recente
 # Se 404 occurir, troque para "gemini-flash-latest" como fallback
 GEMINI_MODEL: str = "gemini-3.5-flash"
+GEMINI_MODELS_FALLBACK: list[str] = [
+    GEMINI_MODEL,
+    "gemini-3.1-pro-preview",
+    "gemini-flash-latest",
+]
 
 MAX_RETRIES: int = 3
+MODEL_MAX_RETRIES: int = 2
 RETRY_DELAY_SECONDS: int = 10
+FALLBACK_503_WAIT_SECONDS: int = 20
 
 if GEMINI_API_KEY:
     client = genai.Client(api_key=GEMINI_API_KEY)
     logger.info("Cliente Gemini inicializado (modelo: %s)", GEMINI_MODEL)
+
+groq_client: Optional[Groq] = None
+GROQ_MODEL: str = "llama-3.3-70b-versatile"
+if GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    logger.info("Cliente Groq inicializado (fallback: %s)", GROQ_MODEL)
+else:
+    logger.warning("GROQ_API_KEY não configurada – fallback de roteiro desabilitado.")
 
 # Vozes edge-tts
 VOICES: Dict[str, str] = {
@@ -752,17 +769,42 @@ def _parse_retry_delay(exc: Exception) -> Optional[float]:
     return float(match.group(1)) if match else None
 
 
+def _groq_generate(prompt: str) -> str:
+    if groq_client is None:
+        raise RuntimeError("GROQ_API_KEY não configurada.")
+    logger.info("Groq (%s)…", GROQ_MODEL)
+    resp = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+    )
+    return resp.choices[0].message.content or ""
+
+
+def _generate_with_fallback(prompt: str) -> str:
+    try:
+        return _gemini_generate(prompt)
+    except Exception as exc:
+        logger.warning("Gemini falhou (%s). Tentando Groq…", exc)
+        if groq_client is not None:
+            return _groq_generate(prompt)
+        raise
+
+
 def _gemini_generate(prompt: str) -> str:
     """
-    Envia prompt ao Gemini com throttle global, retry exponencial e
-    tratamento específico de cota (RetryInfo / free-tier diário).
+    Envia prompt ao Gemini com cadeia de modelos de fallback, throttle global,
+    retry exponencial e tratamento específico de cota (RetryInfo / free-tier diário).
+
+    Em caso de 503 (alta demanda), tenta o próximo modelo da lista imediatamente
+    em vez de insistir no mesmo.
 
     Returns:
         Texto da resposta.
 
     Raises:
         GeminiQuotaError: cota estourada (com retry_in_seconds para agendar).
-        RuntimeError: falha definitiva (modelo/credencial/esgotado).
+        RuntimeError: falha definitiva (todos os modelos esgotados/erro crítico).
     """
     global _gemini_last_call_ts
 
@@ -772,90 +814,117 @@ def _gemini_generate(prompt: str) -> str:
         )
 
     last_error: Optional[Exception] = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        # Throttle global: nunca mais que ~1 chamada a cada MIN_INTERVAL
-        with _gemini_rate_lock:
-            wait = GEMINI_MIN_INTERVAL_SECONDS - (time.monotonic() - _gemini_last_call_ts)
-            if wait > 0:
-                time.sleep(wait)
-            _gemini_last_call_ts = time.monotonic()
+    total_models = len(GEMINI_MODELS_FALLBACK)
 
-        try:
-            logger.info("Gemini – tentativa %d/%d…", attempt, MAX_RETRIES)
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            return response.text or ""
-        except google_exceptions.NotFound as exc:
-            logger.error(
-                "Modelo não encontrado (404). Modelo '%s' Erro: %s",
-                GEMINI_MODEL, exc,
-            )
-            raise RuntimeError(
-                f"Modelo '{GEMINI_MODEL}' não encontrado."
-            ) from exc
-        except google_exceptions.PermissionDenied as exc:
-            logger.error("Permissão negada (403): %s", exc)
-            raise RuntimeError("Permissão negada. Verifique a GEMINI_API_KEY.") from exc
-        except (google_exceptions.ResourceExhausted, google_exceptions.TooManyRequests) as exc:
-            delay = _parse_retry_delay(exc)
-            text = str(exc)
-            daily = "PerDay" in text or "quota exceeded" in text.lower() and "day" in text.lower()
-            if daily or (delay and delay > 120):
-                retry_in = delay or 3600
-                logger.error(
-                    "Gemini: cota FREE-TIER diária esgotada (~%ds). Não insistir.",
-                    int(retry_in),
+    for model_idx, model_name in enumerate(GEMINI_MODELS_FALLBACK, start=1):
+        logger.info(
+            "Gemini – modelo [%d/%d]: %s", model_idx, total_models, model_name
+        )
+        skip_to_next_model = False
+
+        for attempt in range(1, MODEL_MAX_RETRIES + 1):
+            with _gemini_rate_lock:
+                wait = GEMINI_MIN_INTERVAL_SECONDS - (time.monotonic() - _gemini_last_call_ts)
+                if wait > 0:
+                    time.sleep(wait)
+                _gemini_last_call_ts = time.monotonic()
+
+            try:
+                logger.info(
+                    "Gemini (%s) – tentativa %d/%d…", model_name, attempt, MODEL_MAX_RETRIES
                 )
-                raise GeminiQuotaError(
-                    "Cota diária gratuita do Gemini esgotada. Faça upgrade do plano "
-                    "no AI Studio ou aguarde a virada da cota.",
-                    retry_in_seconds=retry_in,
-                ) from exc
-            last_error = exc
-            backoff = max(delay or RETRY_DELAY_SECONDS, RETRY_DELAY_SECONDS) * attempt
-            logger.warning(
-                "Gemini 429 (rate limit) tentativa %d/%d. Retry em %.0fs…",
-                attempt, MAX_RETRIES, backoff,
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(backoff)
-            continue
-        except google_exceptions.ServiceUnavailable as exc:
-            last_error = exc
-            logger.warning(
-                "Indisponível (503) tentativa %d/%d. Retry em %ds…",
-                attempt, MAX_RETRIES, RETRY_DELAY_SECONDS,
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SECONDS)
-            continue
-        except Exception as exc:
-            # SDK novo (google.genai.errors.ClientError) também cai aqui
-            status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-            if status == 429 or "RESOURCE_EXHAUSTED" in str(exc):
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                return response.text or ""
+            except google_exceptions.NotFound as exc:
+                logger.warning(
+                    "Modelo '%s' não encontrado (404). Próximo da lista.", model_name
+                )
+                last_error = exc
+                skip_to_next_model = True
+                break
+            except google_exceptions.PermissionDenied as exc:
+                logger.error("Permissão negada (403): %s", exc)
+                raise RuntimeError("Permissão negada. Verifique a GEMINI_API_KEY.") from exc
+            except (google_exceptions.ResourceExhausted, google_exceptions.TooManyRequests) as exc:
                 delay = _parse_retry_delay(exc)
-                if delay and delay > 120:
+                text = str(exc)
+                daily = "PerDay" in text or "quota exceeded" in text.lower() and "day" in text.lower()
+                if daily or (delay and delay > 120):
+                    retry_in = delay or 3600
+                    logger.error(
+                        "Gemini: cota FREE-TIER diária esgotada (~%ds). Não insistir.",
+                        int(retry_in),
+                    )
                     raise GeminiQuotaError(
-                        "Cota diária gratuita do Gemini esgotada. Faça upgrade "
+                        "Cota diária gratuita do Gemini esgotada. Faça upgrade do plano "
                         "no AI Studio ou aguarde a virada da cota.",
-                        retry_in_seconds=delay,
+                        retry_in_seconds=retry_in,
                     ) from exc
                 last_error = exc
                 backoff = max(delay or RETRY_DELAY_SECONDS, RETRY_DELAY_SECONDS) * attempt
                 logger.warning(
-                    "Gemini 429 tentativa %d/%d. Retry em %.0fs…",
-                    attempt, MAX_RETRIES, backoff,
+                    "Gemini 429 (%s) tentativa %d/%d. Retry em %.0fs…",
+                    model_name, attempt, MODEL_MAX_RETRIES, backoff,
                 )
-                if attempt < MAX_RETRIES:
+                if attempt < MODEL_MAX_RETRIES:
                     time.sleep(backoff)
+                else:
+                    skip_to_next_model = True
                 continue
-            logger.error("Erro inesperado no Gemini: %s", exc)
-            raise
+            except google_exceptions.ServiceUnavailable as exc:
+                last_error = exc
+                logger.warning(
+                    "Gemini 503 (%s) – alta demanda. Tentativa %d/%d.",
+                    model_name, attempt, MODEL_MAX_RETRIES,
+                )
+                if attempt < MODEL_MAX_RETRIES:
+                    time.sleep(FALLBACK_503_WAIT_SECONDS)
+                else:
+                    logger.info(
+                        "Gemini 503 persistente em '%s'. Trocando de modelo.", model_name
+                    )
+                    skip_to_next_model = True
+                continue
+            except Exception as exc:
+                status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                if status == 429 or "RESOURCE_EXHAUSTED" in str(exc):
+                    delay = _parse_retry_delay(exc)
+                    if delay and delay > 120:
+                        raise GeminiQuotaError(
+                            "Cota diária gratuita do Gemini esgotada. Faça upgrade "
+                            "no AI Studio ou aguarde a virada da cota.",
+                            retry_in_seconds=delay,
+                        ) from exc
+                    last_error = exc
+                    backoff = max(delay or RETRY_DELAY_SECONDS, RETRY_DELAY_SECONDS) * attempt
+                    logger.warning(
+                        "Gemini 429 (%s) tentativa %d/%d. Retry em %.0fs…",
+                        model_name, attempt, MODEL_MAX_RETRIES, backoff,
+                    )
+                    if attempt < MODEL_MAX_RETRIES:
+                        time.sleep(backoff)
+                    else:
+                        skip_to_next_model = True
+                    continue
+                if status == 503 or "UNAVAILABLE" in str(exc):
+                    last_error = exc
+                    logger.warning(
+                        "Gemini 503 (%s) via exceção genérica. Tentativa %d/%d.",
+                        model_name, attempt, MODEL_MAX_RETRIES,
+                    )
+                    if attempt < MODEL_MAX_RETRIES:
+                        time.sleep(FALLBACK_503_WAIT_SECONDS)
+                    else:
+                        skip_to_next_model = True
+                    continue
+                logger.error("Erro inesperado no Gemini (%s): %s", model_name, exc)
+                raise
 
     raise RuntimeError(
-        f"Gemini indisponível após {MAX_RETRIES} tentativas."
+        f"Gemini indisponível após esgotar {total_models} modelo(s) de fallback."
     ) from last_error
 
 
@@ -991,18 +1060,30 @@ Regras:
 
     elif tipo == "tiktok" or duracao == "micro":
         prompt = f"""
-Roteiro TIKTOK de 25-40 SEGUNDOS (80-110 palavras) sobre: {tema}.
+Escreva UMA SERIE DE TIKTOK com EXATAMENTE 3 PARTES sobre: {tema}.
+Todas as partes sao DO MESMO TEMA, em sequencia narrativa (parte 1 -> 2 -> 3).
 
-Estrutura:
-- [0:00-0:03] Gancho forte e direto (pergunta, fato chocante ou curiosidade)
-- [0:03-0:15] Contexto rapido + dado concreto
-- [0:15-0:30] Solucao ou insight principal
-- [0:30-0:38] CTA curto ("segue pra mais", "comenta ai")
+FORMATO OBRIGATORIO — use exatamente estas marcacoes:
+[PARTE 1]
+(texto da parte 1)
 
-Tom: dinamico, informal, frases curtas. MAXIMO 110 palavras.
-Escreva APENAS o texto da narracao, sem direcoes de cena.
+[PARTE 2]
+(texto da parte 2)
+
+[PARTE 3]
+(texto da parte 3)
+
+REGRAS POR PARTE:
+- Maximo 35 PALAVRAS cada (equivale a ~13-15 segundos de fala)
+- Frases curtas, ritmo acelerado, linguagem informal de TikTok
+- Parte 1: gancho forte + contexto inicial (prende nos primeiros 2s)
+- Parte 2: desenvolvimento / dado concreto / demonstracao
+- Parte 3: clímax + CTA ("segue pra mais", "comenta ai", "salva esse video")
+- Cada parte deve funcionar como video independente MAS conectar com a anterior
+- SEM direcoes de cena, SEM titulos alem das marcacoes [PARTE N]
+- APENAS o texto falado de cada parte
         """.strip()
-        min_w, max_w = 70, 120
+        min_w, max_w = 60, 120
 
     elif duracao == "reel" or tipo == "shopee":
         prompt = f"""
@@ -1023,7 +1104,7 @@ Escreva APENAS o texto da narração.
         raise ValueError(f"Combinação inválida: tipo={tipo!r} duracao={duracao!r}")
 
     logger.info("Gemini – roteiro %s/%s ('%s')…", tipo, duracao, tema[:50])
-    script = _gemini_generate(prompt).strip()
+    script = _generate_with_fallback(prompt).strip()
     _log_script_stats(script)
 
     if not validate_script_length(script, min_w, max_w):
@@ -1034,7 +1115,7 @@ Escreva APENAS o texto da narração.
             + f"Entregue OBRIGATORIAMENTE entre {min_w} e {max_w} palavras, "
             + "desenvolvendo cada bloco com dados, exemplos e transições."
         )
-        script = _gemini_generate(expand_prompt).strip()
+        script = _generate_with_fallback(expand_prompt).strip()
         _log_script_stats(script)
         if not validate_script_length(script, min_w, max_w):
             raise ValueError(
@@ -1801,6 +1882,96 @@ def render_slideshow_clips(
     return output_path
 
 
+def render_tiktok_part(
+    clip_paths: List[str],
+    audio_path: str,
+    output_path: str,
+    max_duration: float = 15.0,
+    subtitle_srt: Optional[str] = None,
+    width: int = 1080,
+    height: int = 1920,
+    fps: int = 30,
+) -> str:
+    """
+    Renderiza uma parte de TikTok 9:16 com duracao maxima rigida.
+    Corta o audio em max_duration e encadeia os clipes cobrindo essa janela,
+    com legenda SRT queimada (subtitles filter) quando fornecida.
+    """
+    audio_sec = min(get_media_duration(audio_path), max_duration)
+    d = f"{audio_sec:.2f}"
+    fo = max(audio_sec - 0.4, 0.0)
+
+    inputs: List[str] = ["-i", audio_path]
+    filter_parts: List[str] = []
+    spans: List[float] = []
+
+    if not clip_paths:
+        filter_parts.append(
+            f"color=c=0x0d0d14:s={width}x{height}:r={fps}:d={d}[n0]"
+        )
+        chain = "[n0]"
+        n_inputs = 1
+    else:
+        per_scene = audio_sec / len(clip_paths)
+        for i, clip in enumerate(clip_paths):
+            is_image = Path(clip).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+            span = max(per_scene, 1.0)
+            spans.append(span)
+            if is_image:
+                frames = int(span * fps)
+                inputs += ["-loop", "1", "-t", f"{span:.2f}", "-i", clip]
+                filter_parts.append(
+                    f"[{len(spans)}:v]scale={width * 2}:{height * 2}:force_original_aspect_ratio=increase,"
+                    f"crop={width * 2}:{height * 2},setsar=1,"
+                    f"zoompan=z='min(zoom+0.0015,1.2)':x='iw/2-(iw/zoom/2)':"
+                    f"y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps},"
+                    f"format=yuv420p[n{i}]"
+                )
+            else:
+                inputs += ["-ss", "0", "-t", f"{span:.2f}", "-i", clip]
+                filter_parts.append(
+                    f"[{len(spans)}:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},setsar=1,format=yuv420p[n{i}]"
+                )
+        n_inputs = len(spans) + 1
+        if len(spans) == 1:
+            chain = "[n0]"
+        else:
+            chain = "[n0]"
+            acc = 0.0
+            for i in range(1, len(spans)):
+                offset = max(acc + spans[i - 1] - 0.4, 0.0)
+                label = "vx" if i == len(spans) - 1 else f"m{i}"
+                filter_parts.append(
+                    f"{chain}[n{i}]xfade=transition=fade:duration=0.4:offset={offset:.2f}[{label}]"
+                )
+                chain = f"[{label}]"
+                acc += spans[i - 1] - 0.4
+
+    vf_chain = f"{chain}tpad=stop_mode=clone:stop_duration={d},fade=t=out:st={fo:.2f}:d=0.4"
+    if subtitle_srt and Path(subtitle_srt).exists():
+        srt_esc = subtitle_srt.replace("\\", "/").replace(":", "\\:")
+        vf_chain += f",subtitles='{srt_esc}':force_style='FontName=Arial Black,FontSize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=60'"
+    vf_chain += ",format=yuv420p[vout]"
+    filter_parts.append(vf_chain)
+
+    args = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[vout]", "-map", "0:a",
+        "-af", f"afade=t=in:st=0:d=0.2,afade=t=out:st={fo:.2f}:d=0.4",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "21",
+        "-c:a", "aac", "-b:a", "128k",
+        "-t", d,
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    logger.info("Renderizando parte TikTok (%.1fs)…", audio_sec)
+    _run_ffmpeg(args, "tiktok-part")
+    return output_path
+
+
 def _render_solid_bg(
     audio_path: str, output_path: str, width: int, height: int, duration: float
 ) -> str:
@@ -2245,7 +2416,7 @@ def generate_shopee_video(
     except ValueError as exc:
         # Reels curtos variam muito; aceita-se o melhor resultado com warning
         logger.warning("Validação do reel flexível: %s", exc)
-        script = _gemini_generate(
+        script = _generate_with_fallback(
             f"Copy de 25-35 segundos (70-90 palavras), estilo TikTok/achadinho, "
             f"sobre este produto Shopee com dados reais:\n{tema_reel}\n\n"
             f"Gancho → problema que resolve → preço/desconto/urgência → "
